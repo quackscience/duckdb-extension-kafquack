@@ -15,27 +15,38 @@ struct KafkaConsumerData : public TableFunctionData {
     string brokers;
     string topic;
     string group_id;
+    string security_protocol;
+    string sasl_mechanism;
+    string username;
+    string password;
     unique_ptr<cppkafka::Consumer> consumer;
     bool running = true;
     
-    // Buffer for messages
     std::mutex buffer_mutex;
     std::vector<cppkafka::Message> message_buffer;
     static constexpr size_t BUFFER_SIZE = 1000;
 
-    KafkaConsumerData(string brokers, string topic, string group_id) 
-        : brokers(brokers), topic(topic), group_id(group_id) {
-        
-        // Configure Kafka consumer
-        cppkafka::Configuration config = {
-            { "metadata.broker.list", brokers },
-            { "group.id", group_id },
-            { "enable.auto.commit", false }
-        };
+    unique_ptr<FunctionData> Copy() const override {
+        auto result = make_uniq<KafkaConsumerData>();
+        result->brokers = brokers;
+        result->topic = topic;
+        result->group_id = group_id;
+        result->security_protocol = security_protocol;
+        result->sasl_mechanism = sasl_mechanism;
+        result->username = username;
+        result->password = password;
+        return result;
+    }
 
-        // Create consumer
-        consumer = make_uniq<cppkafka::Consumer>(config);
-        consumer->subscribe({topic});
+    bool Equals(const FunctionData &other_p) const override {
+        auto &other = other_p.Cast<KafkaConsumerData>();
+        return brokers == other.brokers && 
+               topic == other.topic &&
+               group_id == other.group_id &&
+               security_protocol == other.security_protocol &&
+               sasl_mechanism == other.sasl_mechanism &&
+               username == other.username &&
+               password == other.password;
     }
 
     ~KafkaConsumerData() {
@@ -55,15 +66,38 @@ struct KafkaConsumerGlobalState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> KafkaConsumerBind(ClientContext &context, 
-                                                 TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, 
-                                                 vector<string> &names) {
-    
-    auto brokers = input.inputs[0].GetValue<string>();
-    auto topic = input.inputs[1].GetValue<string>();
-    auto group_id = input.inputs[2].GetValue<string>();
+                                                TableFunctionBindInput &input,
+                                                vector<LogicalType> &return_types, 
+                                                vector<string> &names) {
+    auto result = make_uniq<KafkaConsumerData>();
+    result->brokers = input.inputs[0].GetValue<string>();
+    result->topic = input.inputs[1].GetValue<string>();
+    result->group_id = input.inputs[2].GetValue<string>();
 
-    // Define the schema for our Kafka messages
+    for (auto &kv : input.named_parameters) {
+        if (kv.first == "security_protocol") {
+            result->security_protocol = StringValue::Get(kv.second);
+            if (result->security_protocol != "SASL_SSL" && result->security_protocol != "SASL_PLAINTEXT") {
+                throw InvalidInputException("security_protocol must be either SASL_SSL or SASL_PLAINTEXT");
+            }
+        } else if (kv.first == "sasl_mechanism") {
+            result->sasl_mechanism = StringValue::Get(kv.second);
+            if (result->sasl_mechanism != "SCRAM-SHA-256" && result->sasl_mechanism != "PLAIN") {
+                throw InvalidInputException("sasl_mechanism must be either SCRAM-SHA-256 or PLAIN");
+            }
+        } else if (kv.first == "username") {
+            result->username = StringValue::Get(kv.second);
+        } else if (kv.first == "password") {
+            result->password = StringValue::Get(kv.second);
+        } else {
+            throw InvalidInputException("Unknown named parameter: %s", kv.first);
+        }
+    }
+
+    if (!result->security_protocol.empty() && (result->username.empty() || result->password.empty())) {
+        throw InvalidInputException("username and password are required when security_protocol is set");
+    }
+
     names = {"topic", "partition", "offset", "timestamp", "key", "value", "error"};
     return_types = {
         LogicalType::VARCHAR,    // topic
@@ -75,7 +109,26 @@ static unique_ptr<FunctionData> KafkaConsumerBind(ClientContext &context,
         LogicalType::VARCHAR     // error
     };
 
-    return make_uniq<KafkaConsumerData>(brokers, topic, group_id);
+    try {
+        cppkafka::Configuration config;
+        config.set("metadata.broker.list", result->brokers);
+        config.set("group.id", result->group_id);
+        config.set("enable.auto.commit", false);
+
+        if (!result->security_protocol.empty()) {
+            config.set("security.protocol", result->security_protocol);
+            config.set("sasl.mechanisms", result->sasl_mechanism.empty() ? "PLAIN" : result->sasl_mechanism);
+            config.set("sasl.username", result->username);
+            config.set("sasl.password", result->password);
+        }
+
+        result->consumer = make_uniq<cppkafka::Consumer>(config);
+        result->consumer->subscribe({result->topic});
+    } catch (const cppkafka::Exception &e) {
+        throw InvalidInputException("Failed to create Kafka consumer: %s", e.what());
+    }
+
+    return result;
 }
 
 static unique_ptr<GlobalTableFunctionState> KafkaConsumerInit(ClientContext &context,
@@ -87,53 +140,44 @@ static void KafkaConsumerFunction(ClientContext &context, TableFunctionInput &da
                                 DataChunk &output) {
     auto &data = data_p.bind_data->Cast<KafkaConsumerData>();
     
-    // Vector to store the messages for this chunk
     vector<cppkafka::Message> messages;
     
-    // Try to get messages up to the vector size
     idx_t chunk_size = 0;
     while (chunk_size < STANDARD_VECTOR_SIZE && data.running) {
-        auto msg = data.consumer->poll(std::chrono::milliseconds(100));
-        if (!msg) {
-            continue;
+        try {
+            auto msg = data.consumer->poll(std::chrono::milliseconds(100));
+            if (!msg) {
+                continue;
+            }
+            messages.push_back(std::move(msg));
+            chunk_size++;
+        } catch (const cppkafka::Exception &e) {
+            throw InvalidInputException("Error polling Kafka: %s", e.what());
         }
-        
-        messages.push_back(std::move(msg));
-        chunk_size++;
     }
 
     if (chunk_size == 0) {
-        // No messages available
         output.SetCardinality(0);
         return;
     }
 
-    // Set up the output vectors
     output.SetCardinality(chunk_size);
     
     for (idx_t i = 0; i < chunk_size; i++) {
         const auto &msg = messages[i];
         
-        // topic
         output.data[0].SetValue(i, Value(msg.get_topic()));
-        
-        // partition
         output.data[1].SetValue(i, Value::INTEGER(msg.get_partition()));
-        
-        // offset
         output.data[2].SetValue(i, Value::BIGINT(msg.get_offset()));
         
-        // timestamp
         auto ts = msg.get_timestamp();
         if (ts) {
-            // Get milliseconds since epoch and convert to timestamp
             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(ts.get().get_timestamp());
             output.data[3].SetValue(i, Value::TIMESTAMP(Timestamp::FromEpochMs(ms.count())));
         } else {
             FlatVector::SetNull(output.data[3], i, true);
         }
         
-        // key
         if (msg.get_key()) {
             string key_str(reinterpret_cast<const char*>(msg.get_key().get_data()), 
                          msg.get_key().get_size());
@@ -142,7 +186,6 @@ static void KafkaConsumerFunction(ClientContext &context, TableFunctionInput &da
             FlatVector::SetNull(output.data[4], i, true);
         }
         
-        // value and error
         if (!msg.get_error()) {
             string value_str(reinterpret_cast<const char*>(msg.get_payload().get_data()), 
                            msg.get_payload().get_size());
@@ -153,25 +196,33 @@ static void KafkaConsumerFunction(ClientContext &context, TableFunctionInput &da
             output.data[6].SetValue(i, Value(msg.get_error().to_string()));
         }
 
-        // Commit the message
-        data.consumer->commit(msg);
+        try {
+            data.consumer->commit(msg);
+        } catch (const cppkafka::Exception &e) {
+            throw InvalidInputException("Error committing message: %s", e.what());
+        }
     }
 }
 
-class KafquackExtension : public Extension {  // Changed from KafkaExtension to KafquackExtension
+class KafquackExtension : public Extension {
 public:
     void Load(DuckDB &db) override {
-        // Register the Kafka consumer function
         vector<LogicalType> args = {
             LogicalType::VARCHAR,    // brokers
             LogicalType::VARCHAR,    // topic
             LogicalType::VARCHAR     // group_id
         };
         
+        named_parameter_type_map_t named_params = {
+            {"security_protocol", LogicalType::VARCHAR},
+            {"sasl_mechanism", LogicalType::VARCHAR},
+            {"username", LogicalType::VARCHAR},
+            {"password", LogicalType::VARCHAR}
+        };
+        
         TableFunction kafka_consumer("kafka_consumer", args, KafkaConsumerFunction, 
                                    KafkaConsumerBind, KafkaConsumerInit);
-        
-        // Set parallel properties
+        kafka_consumer.named_parameters = named_params;
         kafka_consumer.projection_pushdown = false;
         kafka_consumer.filter_pushdown = false;
         
@@ -179,10 +230,9 @@ public:
     }
 
     std::string Name() override {
-        return "kafquack";  // Changed from "kafka" to "kafquack"
+        return "kafquack";
     }
 
-    // Add Version method implementation
     std::string Version() const override {
 #ifdef KAFQUACK_VERSION
         return KAFQUACK_VERSION;
@@ -195,12 +245,12 @@ public:
 } // namespace duckdb
 
 extern "C" {
-DUCKDB_EXTENSION_API void kafquack_init(duckdb::DatabaseInstance &db) {  // Changed from kafka_init
+DUCKDB_EXTENSION_API void kafquack_init(duckdb::DatabaseInstance &db) {
     duckdb::DuckDB db_wrapper(db);
     db_wrapper.LoadExtension<duckdb::KafquackExtension>();
 }
 
-DUCKDB_EXTENSION_API const char *kafquack_version() {  // Changed from kafka_version
+DUCKDB_EXTENSION_API const char *kafquack_version() {
     return duckdb::DuckDB::LibraryVersion();
 }
 }
