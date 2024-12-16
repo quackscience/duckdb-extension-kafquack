@@ -8,13 +8,13 @@ This extension allows you to consume Kafka messages through a DuckDB Table funct
 
 #### Basic usage:
 ```sql
-SELECT * FROM kafka_consumer('localhost:9092', 'test-topic', 'test-group');
+SELECT * FROM kafquack('localhost:9092', 'test-topic', 'test-group');
 ```
 
 #### Secure usage:
 
 ```sql
-SELECT * FROM kafka_consumer(
+SELECT * FROM kafquack(
     'broker.some.cloud:9092', 
     'test-topic',
     'test-group',
@@ -23,4 +23,14 @@ SELECT * FROM kafka_consumer(
     username := 'your-key',
     password := 'your-secret'
 );
+```
+
+#### View
+```sql
+-- Create a view that consumes messages from Kafka
+CREATE VIEW kafka_messages AS 
+SELECT * FROM kafquack('localhost:9092', 'test-topic', 'test-group');
+
+-- Query messages
+SELECT * FROM kafka_messages;
 ```
