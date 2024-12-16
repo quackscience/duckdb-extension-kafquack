@@ -12,12 +12,8 @@ Catalog Error: Scalar Function with name kafquack does not exist!
 require kafquack
 
 # Confirm the extension works
-query I
-SELECT kafquack('Sam');
+statement error
+SELECT * FROM kafka_consumer('test');
 ----
-Kafquack Sam 🐥
+Binder Error: No function matches the given name and argument types 'kafka_consumer(VARCHAR)'. You might need to add explicit type casts.
 
-query I
-SELECT kafquack_openssl_version('Michael') ILIKE 'Kafquack Michael, my linked OpenSSL version is OpenSSL%';
-----
-true
