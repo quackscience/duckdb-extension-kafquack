@@ -1,6 +1,8 @@
+<img src="https://github.com/user-attachments/assets/46a5c546-7e9b-42c7-87f4-bc8defe674e0" width=250 />
+
 # DuckDB Kafka Extension
 
-This extension allows you to consume Kafka messages through a DuckDB Table function that connects to a Kafka broker and streams messages as a table.
+This extension can be used to consume Kafka messages from brokers through a DuckDB Table function.
 
 > The extension is a WIP and not functional! Join if you're willing to contribute!
 
